@@ -485,7 +485,10 @@ def load_inputs(config, data_path, load_predictions, task_data):
 
 def run_predictions_generation_save_results(data_df, config, output_path):
     provider = config["provider"]
-    gen_llm = get_llm_client(provider=provider, model=config["gen_model_name"], eval_mode=False)
+    inference_backend = config.get("inference_backend", "langchain")
+    endpoint_url = config.get("endpoint_url")
+    gen_llm = get_llm_client(provider=provider, model=config["gen_model_name"], eval_mode=False,
+                             inference_backend=inference_backend, endpoint_url=endpoint_url)
     gen_df = generate_model_predictions(data_df, gen_llm, config)
     save_dataframe_to_cache(gen_df, output_path)
     return gen_df

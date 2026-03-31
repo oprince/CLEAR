@@ -13,8 +13,8 @@ endpoint_url: https://ete-litellm.ai-models.vpc-int.res.ibm.com
 provider: openai
 provider_defaults:
   openai:
-    gen_model_name: gcp/gemini-2.5-flash
-    eval_model_name: gcp/gemini-2.5-flash
+    gen_model_name: gemini-2.5-flash
+    eval_model_name: gemini-2.5-flash
     max_workers: 20
   watsonx:
     gen_model_name: ibm/granite-3-3-8b-instruct

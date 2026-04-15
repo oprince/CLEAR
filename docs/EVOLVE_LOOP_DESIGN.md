@@ -1,16 +1,87 @@
 # Evolve Loop Analysis — Design
 
-## 1. Overview
+## 1. Architectural Decision
 
-This document describes the design for extending CLEAR with an `evolve_loop` analysis mode. The extension reuses CLEAR's existing LLM-as-judge pipeline, inference backends, caching system, and dashboard infrastructure. New components are confined to input adapters, deterministic analyzers, LLM judge agents, a historical database, and dashboard extensions.
+### Decision: Standalone tool — shared code copied from CLEAR, no runtime dependency
 
-The architecture adopts a **coordinator + specialist agents** pattern: a thin coordinator orchestrates four specialist components — Ingestion Agent, Quantitative Analyzer, Qualitative Analyzer, Comparative Analyzer — and feeds their outputs into a Report Synthesizer. Steps with zero LLM cost always run first; LLM calls are deferred until the deterministic tagging is complete.
+The evolve loop analyzer is implemented as a **fully independent tool** (`evolve-analyzer`). The small set of LLM infrastructure modules shared with CLEAR is **vendored** (copied and owned) rather than imported as a package dependency.
+
+### Rationale — why a separate tool
+
+The question was whether the scope of shared logic justified embedding this tool within CLEAR's codebase. A systematic comparison revealed that the overlap is limited to the LLM infrastructure layer:
+
+| CLEAR component | Reuse verdict | Reason |
+|---|---|---|
+| `LLMClient` / `get_llm_client` | ✅ Copied | Abstraction over LangChain/LiteLLM/Endpoint |
+| `caching_utils` | ✅ Copied | Resume support, deduplication |
+| `run_parallel` | ✅ Copied | Thread-pool for LLM judge calls |
+| `BaseUseCase` | ❌ Not used | Forces CLEAR's linear pipeline shape; incompatible with coordinator pattern |
+| `synthesize_shortcomings_from_df` | ❌ Not used | Tightly coupled to CLEAR's per-call CSV format |
+| `map_shortcomings_to_records` | ❌ Not used | Same reason |
+| `save_ui_input_results` / dashboard | ❌ Not used | Table browser for eval calls; incompatible with time-series UI paradigm |
+| `load_config` / `merge_configs` | ❌ Not used | Any config library serves equally; no shared schema |
+
+The divergences that make a shared codebase inappropriate:
+
+1. **Data model is fundamentally different.** CLEAR's unit is an evaluation call: one row = `(input, expected_output, actual_output, judge_score)`, order irrelevant. The evolve loop's unit is an iteration in a time series: order is the entire point. Fields like `streak_id`, `plateau_onset_iteration`, `recovery_iteration`, and `change_points` have no analog in CLEAR's schema.
+
+2. **The quantitative analyzer is larger than CLEAR's existing analysis codebase.** Ten deterministic analyzers covering stagnation, convergence, regression, exploration, efficiency, search space, meta-analysis, ceiling detection, evaluator behavior, and compliance share no logic with CLEAR's existing analysis pipeline. Locating them inside CLEAR adds weight without reuse.
+
+3. **The multi-agent coordinator pattern conflicts with CLEAR's linear pipeline.** CLEAR's pipeline is: analyze → evaluate → aggregate → synthesize. The evolve loop requires a coordinator that runs deterministic analyzers first (zero LLM cost), dispatches multiple specialist LLM agents on tagged data, queries a historical database, and then synthesizes. Forcing this into `BaseUseCase` would produce an architectural pretense — the interface is implemented but immediately bypassed.
+
+4. **The historical database is a new infrastructure concern.** Cross-experiment comparative analysis requires a persistent store that accumulates across runs. CLEAR has no concept of cross-experiment state. Adding it to CLEAR couples an evaluation framework to an optimization experiment registry with a different lifecycle.
+
+5. **The dashboard paradigm is different.** CLEAR's dashboard is a table browser for evaluation calls. The evolve loop needs time-series charts, stagnation-shaded score progression curves, efficiency curves, and an exploration/exploitation timeline. These panels share no component logic with CLEAR's existing UI.
+
+6. **The user populations are different.** CLEAR users are prompt engineers and ML engineers evaluating model output quality. Evolve loop users are researchers running evolutionary code optimization experiments. Bundling them in one CLI namespace creates a confusing surface for both groups.
+
+### Rationale — why copy rather than depend on CLEAR as a package
+
+Even for the three modules that are worth reusing, a pip dependency on `clear_eval` is the wrong mechanism:
+
+1. **CLEAR is a tool, not a library.** Its internal APIs (`get_llm_client`, `run_parallel`, `cache_call`) are not versioned contracts — they are implementation details subject to refactor without notice. A dependency would couple `evolve-analyzer`'s stability to CLEAR's internal churn.
+
+2. **Transitive dependency pollution.** Installing `clear_eval` pulls in its full dependency tree (LangChain, MLflow/Langfuse clients, Streamlit, etc.). `evolve-analyzer` needs none of those — only the LLM client abstractions. Vendoring copies only what is actually used.
+
+3. **The shared surface is small and stable.** Three modules — LLM client abstraction, thread-pool wrapper, cache utility — total fewer than 300 lines. This is well within the threshold where vendoring is simpler than dependency management.
+
+4. **Independent evolution.** Once copied, each tool can evolve its LLM layer independently. If CLEAR switches its caching backend or changes how it handles provider authentication, `evolve-analyzer` is not affected.
+
+5. **Simpler installation for users.** `pip install evolve-analyzer` installs only what the tool actually needs. No CLEAR configuration files, no CLEAR CLI commands, no surprise dependencies on MLflow or Langfuse.
+
+### Consequence
+
+The three modules are copied at project creation into `evolve_analyzer/llm/` and maintained independently:
+
+```
+evolve_analyzer/llm/
+├── client.py          # copied from clear_eval/llm/client.py — LLM provider abstraction
+├── parallel.py        # copied from clear_eval/llm/parallel.py — run_parallel
+└── cache.py           # copied from clear_eval/caching_utils.py — cache_call
+```
+
+A comment at the top of each copied file records the origin and the copy date, so future maintainers can diff against the CLEAR source if they want to pull in upstream improvements manually:
+
+```python
+# Copied from clear_eval/llm/client.py (CLEAR commit abc1234, 2025-01-01).
+# Maintained independently. To sync upstream improvements, diff manually.
+```
+
+CLEAR does **not** appear in `pyproject.toml` at all. All other components — ingestion, analysis pipeline, historical DB, report synthesis, dashboard, and CLI — are implemented independently.
 
 ---
 
-## 2. Architecture
+## 2. Overview
 
-### 2.1 High-Level Flow
+`evolve-analyzer` is a standalone diagnostic tool for post-hoc analysis of evolutionary code optimization experiments. It answers the question: *"What worked and what didn't in this evolve loop run?"* — using the same DL training diagnostics framing (convergence curve shape, exploration/exploitation balance, cost efficiency, ceiling detection) applied to evolutionary optimization.
+
+The architecture adopts a **coordinator + specialist agents** pattern: a thin coordinator orchestrates four specialist components — Ingestion Agent, Quantitative Analyzer, Qualitative Analyzer, Comparative Analyzer — and feeds their outputs into a Report Synthesizer. Steps with zero LLM cost always run first; LLM calls are deferred until deterministic tagging is complete.
+
+---
+
+## 3. Architecture
+
+### 3.1 High-Level Flow
 
 ```
 Input (JSONL or framework checkpoint)
@@ -45,7 +116,7 @@ Input (JSONL or framework checkpoint)
   LLM Judge: meta-analysis quality (reasoning trace coherence)             │
         │
         ▼
- [Comparative Analyzer]  ─── LLM agent + historical DB ─────────────────
+ [Comparative Analyzer]  ─── historical DB ──────────────────────────────
   Queries historical experiment database
   → "Is this convergence rate typical for this benchmark + tool?"
   → "Is this regression frequency abnormal?"
@@ -68,43 +139,81 @@ Deterministic analyzers always run first at zero LLM cost. They tag every record
 
 ---
 
-## 3. Directory Structure
+## 4. Directory Structure
 
 ```
-src/clear_eval/
-├── evolve_loop/
-│   ├── __init__.py
-│   ├── checkpoint_adapter.py        input normalization (Ingestion Agent)
-│   │
-│   ├── quantitative/
-│   │   ├── __init__.py
-│   │   ├── stagnation_detector.py   streak detection + alert classification
-│   │   ├── evaluator_analyzer.py    failure classification + variance flags
-│   │   ├── compliance_checker.py    EVOLVE-BLOCK, format, signature checks
-│   │   ├── convergence_analyzer.py  best-so-far, change-points, rate
-│   │   ├── exploration_analyzer.py  diversity index, exploit/explore phases
-│   │   ├── regression_analyzer.py   frequency, severity, recovery time
-│   │   ├── efficiency_analyzer.py   cost-per-improvement, Pareto frontier
-│   │   ├── search_space_analyzer.py param distributions, bound detection
-│   │   ├── meta_analyzer.py         suggestion compliance rate, follow rate
-│   │   └── ceiling_analyzer.py      plateau test, marginal improvement trend
-│   │
-│   ├── historical_db.py             SQLite store for cross-experiment data
-│   └── report_synthesizer.py        dimension ratings + structured report
-│
-├── pipeline/
-│   └── use_cases/
-│       └── EvolveLoopUseCase.py     use case class, LLM judge orchestration
-│
-└── dashboard/
-    └── evolve_dashboard.py          extended Streamlit dashboard
+evolve-analyzer/
+├── pyproject.toml               # no clear_eval dependency
+├── config/
+│   └── default_config.yaml
+├── src/
+│   └── evolve_analyzer/
+│       ├── __init__.py
+│       ├── cli.py               # run-evolve-analysis entry point
+│       ├── coordinator.py       # thin orchestrator
+│       │
+│       ├── llm/                 # vendored from CLEAR — maintained independently
+│       │   ├── __init__.py
+│       │   ├── client.py        # LLM provider abstraction (OpenAI/Anthropic/LiteLLM/endpoint)
+│       │   ├── parallel.py      # run_parallel thread-pool wrapper
+│       │   └── cache.py         # cache_call — disk cache for LLM responses
+│       │
+│       ├── ingestion/
+│       │   ├── __init__.py
+│       │   └── checkpoint_adapter.py   # per-framework adapters + auto-detect
+│       │
+│       ├── quantitative/
+│       │   ├── __init__.py
+│       │   ├── bundle.py               # QuantitativeBundle dataclass
+│       │   ├── stagnation_detector.py  # streak detection + alert classification
+│       │   ├── evaluator_analyzer.py   # failure classification + variance flags
+│       │   ├── compliance_checker.py   # EVOLVE-BLOCK, format, signature checks
+│       │   ├── convergence_analyzer.py # best-so-far, change-points, rate
+│       │   ├── exploration_analyzer.py # diversity index, exploit/explore phases
+│       │   ├── regression_analyzer.py  # frequency, severity, recovery time
+│       │   ├── efficiency_analyzer.py  # cost-per-improvement, Pareto frontier
+│       │   ├── search_space_analyzer.py# param distributions, bound detection
+│       │   ├── meta_analyzer.py        # suggestion compliance rate, follow rate
+│       │   └── ceiling_analyzer.py     # plateau test, marginal improvement trend
+│       │
+│       ├── qualitative/
+│       │   ├── __init__.py
+│       │   └── qualitative_analyzer.py # LLM judge orchestration (Steps A–F)
+│       │
+│       ├── historical_db.py            # SQLite store for cross-experiment data
+│       ├── report_synthesizer.py       # dimension ratings + structured report
+│       └── dashboard.py                # Streamlit dashboard (standalone)
+└── tests/
+    ├── test_stagnation_detector.py
+    ├── test_evaluator_analyzer.py
+    ├── test_compliance_checker.py
+    └── ...
+```
+
+**`pyproject.toml` — no CLEAR dependency:**
+
+```toml
+[project]
+name = "evolve-analyzer"
+dependencies = [
+    "pandas",
+    "numpy",
+    "scipy",
+    "streamlit",
+    "click",
+    "pyyaml",
+    "openai",            # used by llm/client.py
+    "anthropic",         # used by llm/client.py
+    "litellm",           # used by llm/client.py
+    "diskcache",         # used by llm/cache.py
+]
 ```
 
 ---
 
-## 4. Component Specifications
+## 5. Component Specifications
 
-### 4.1 Ingestion Agent (`checkpoint_adapter.py`)
+### 5.1 Ingestion Agent (`ingestion/checkpoint_adapter.py`)
 
 Converts framework-specific output into standard JSONL. One adapter function per framework.
 
@@ -114,25 +223,25 @@ def adapt_shinkaevolve(db_path: str) -> Iterator[dict]: ...
 def adapt_openevolve(checkpoint_dir: str, trace_path: str) -> Iterator[dict]: ...
 def load_jsonl(path: str) -> Iterator[dict]: ...  # passthrough for direct JSONL
 
-def load_evolve_records(source: str) -> Iterator[dict]:
+def load_evolve_records(source: str, path: str) -> Iterator[dict]:
     """Auto-detects format and returns normalized records."""
 ```
 
 Each adapter produces records conforming to the standard JSONL schema (see Requirements §7). Derived fields (`score_delta`, `evaluation_status`) are computed during ingestion.
 
-**ShinkaEvolve note:** reads from SQLite via the existing `dbase.py` schema. Framework stagnation events (dynamic island spawns) are mapped to `framework_stagnation_event`.
+**ShinkaEvolve:** reads from SQLite via the existing `dbase.py` schema. Framework stagnation events (dynamic island spawns) are mapped to `framework_stagnation_event`.
 
-**OpenEvolve note:** requires `evolution_trace.enabled: true` in the run config. Without it, only checkpoint-derived fields are available.
+**OpenEvolve:** requires `evolution_trace.enabled: true` in the run config. Without it, only checkpoint-derived fields are available.
 
-**SkyDiscover note:** reads `checkpoints/checkpoint_N/` directories. AdaEvolve paradigm shift events are mapped to `framework_stagnation_event`.
+**SkyDiscover:** reads `checkpoints/checkpoint_N/` directories. AdaEvolve paradigm shift events are mapped to `framework_stagnation_event`.
 
 ---
 
-### 4.2 Quantitative Analyzer
+### 5.2 Quantitative Analyzer (`quantitative/`)
 
 All components are pure functions — no side effects, no LLM calls. They run in sequence on the normalized records and produce a fully tagged DataFrame plus a `QuantitativeBundle` summary dict.
 
-#### 4.2.1 Stagnation Detector (`stagnation_detector.py`)
+#### 5.2.1 Stagnation Detector (`stagnation_detector.py`)
 
 ```python
 @dataclass
@@ -185,9 +294,7 @@ def _assign_severity(period: StagnationPeriod, threshold: int) -> str:
     return "warning"
 ```
 
-#### 4.2.2 Evaluator Analyzer (`evaluator_analyzer.py`)
-
-**Failure mode classification:**
+#### 5.2.2 Evaluator Analyzer (`evaluator_analyzer.py`)
 
 ```python
 FailureMode = Literal[
@@ -212,7 +319,7 @@ def flag_high_variance(record: dict, std_threshold: float = 0.1) -> bool:
     """True if score_std across num_runs exceeds threshold (evaluator noise)."""
 ```
 
-#### 4.2.3 Compliance Checker (`compliance_checker.py`)
+#### 5.2.3 Compliance Checker (`compliance_checker.py`)
 
 ```python
 def check_evolve_block(parent_code: str, child_code: str) -> bool:
@@ -227,7 +334,7 @@ def check_signature_preserved(parent_code: str, child_code: str,
     """True if all function signatures in the parent are unchanged in the child."""
 ```
 
-#### 4.2.4 Convergence Analyzer (`convergence_analyzer.py`)
+#### 5.2.4 Convergence Analyzer (`convergence_analyzer.py`)
 
 ```python
 @dataclass
@@ -244,7 +351,7 @@ class ConvergenceMetrics:
 def analyze_convergence(records: List[dict], window: int = 10) -> ConvergenceMetrics: ...
 ```
 
-#### 4.2.5 Exploration Analyzer (`exploration_analyzer.py`)
+#### 5.2.5 Exploration Analyzer (`exploration_analyzer.py`)
 
 ```python
 @dataclass
@@ -258,7 +365,7 @@ class ExplorationMetrics:
 def analyze_exploration(records: List[dict]) -> ExplorationMetrics: ...
 ```
 
-#### 4.2.6 Regression Analyzer (`regression_analyzer.py`)
+#### 5.2.6 Regression Analyzer (`regression_analyzer.py`)
 
 ```python
 @dataclass
@@ -271,7 +378,7 @@ class RegressionMetrics:
 def analyze_regressions(records: List[dict]) -> RegressionMetrics: ...
 ```
 
-#### 4.2.7 Efficiency Analyzer (`efficiency_analyzer.py`)
+#### 5.2.7 Efficiency Analyzer (`efficiency_analyzer.py`)
 
 ```python
 @dataclass
@@ -287,7 +394,7 @@ class EfficiencyMetrics:
 def analyze_efficiency(records: List[dict]) -> EfficiencyMetrics: ...
 ```
 
-#### 4.2.8 Search Space Analyzer (`search_space_analyzer.py`)
+#### 5.2.8 Search Space Analyzer (`search_space_analyzer.py`)
 
 ```python
 @dataclass
@@ -300,9 +407,9 @@ class SearchSpaceMetrics:
 def analyze_search_space(records: List[dict], top_k: int = 10) -> SearchSpaceMetrics: ...
 ```
 
-#### 4.2.9 Meta-Analyzer (`meta_analyzer.py`)
+#### 5.2.9 Meta-Analyzer (`meta_analyzer.py`)
 
-Only active when `reasoning_trace` fields are available.
+Only active when `reasoning_trace` fields are present.
 
 ```python
 @dataclass
@@ -316,7 +423,7 @@ class MetaAnalysisMetrics:
 def analyze_meta_quality(records: List[dict]) -> MetaAnalysisMetrics: ...
 ```
 
-#### 4.2.10 Ceiling Analyzer (`ceiling_analyzer.py`)
+#### 5.2.10 Ceiling Analyzer (`ceiling_analyzer.py`)
 
 ```python
 @dataclass
@@ -333,34 +440,42 @@ def analyze_ceiling(records: List[dict]) -> CeilingMetrics: ...
 
 ---
 
-### 4.3 Qualitative Analyzer (LLM Agents via `EvolveLoopUseCase.py`)
+### 5.3 Qualitative Analyzer (`qualitative/qualitative_analyzer.py`)
 
-Implements the `BaseUseCase` interface used by CLEAR's existing pipeline.
+Standalone class — does not implement `BaseUseCase` or any CLEAR interface. Uses the vendored LLM infrastructure from `evolve_analyzer.llm`.
 
 ```python
-class EvolveLoopUseCase(BaseUseCase):
+from evolve_analyzer.llm.client import get_llm_client
+from evolve_analyzer.llm.parallel import run_parallel
+from evolve_analyzer.llm.cache import cache_call
 
-    def eval_records(self, df: pd.DataFrame, llm_client, config: dict) -> pd.DataFrame:
-        """Runs all LLM judge steps on the tagged DataFrame."""
+class QualitativeAnalyzer:
+
+    def __init__(self, llm_client, config: dict):
+        self.llm_client = llm_client
+        self.config = config
+
+    def run(self, quant: QuantitativeBundle) -> QualitativeBundle:
+        """Orchestrates all LLM judge steps."""
 
     def _eval_stagnation_periods(
-        self, periods: List[StagnationPeriod], df: pd.DataFrame, llm_client
+        self, periods: List[StagnationPeriod], df: pd.DataFrame
     ) -> List[dict]:
         """Step A: per-stagnation-period root cause analysis."""
 
-    def _eval_artifact_clusters(self, df: pd.DataFrame, llm_client) -> List[dict]:
+    def _eval_artifact_clusters(self, df: pd.DataFrame) -> List[dict]:
         """Step B: evaluator artifact clustering across all failures."""
 
-    def _eval_mutation_quality(self, df: pd.DataFrame, llm_client) -> pd.DataFrame:
+    def _eval_mutation_quality(self, df: pd.DataFrame) -> pd.DataFrame:
         """Step C: per-mutation quality for non-stagnation iterations."""
 
-    def _eval_semantic_compliance(self, df: pd.DataFrame, llm_client) -> pd.DataFrame:
+    def _eval_semantic_compliance(self, df: pd.DataFrame) -> pd.DataFrame:
         """Step D: LLM-as-judge semantic compliance check."""
 
-    def _eval_exploration_structure(self, df: pd.DataFrame, llm_client) -> dict:
+    def _eval_exploration_structure(self, df: pd.DataFrame) -> dict:
         """Step E: structural diversity assessment from code diffs."""
 
-    def _eval_meta_quality(self, df: pd.DataFrame, llm_client) -> dict:
+    def _eval_meta_quality(self, df: pd.DataFrame) -> dict:
         """Step F: reasoning trace coherence and self-contradiction analysis."""
 ```
 
@@ -431,9 +546,9 @@ def check_semantic_compliance(
 
 ---
 
-### 4.4 Comparative Analyzer (`historical_db.py`)
+### 5.4 Comparative Analyzer (`historical_db.py`)
 
-Maintains a SQLite database of past experiment analyses, queryable by benchmark, tool, model, and algorithm.
+Standalone SQLite database, entirely new infrastructure with no CLEAR equivalent.
 
 ```python
 class HistoricalDB:
@@ -466,13 +581,13 @@ class HistoricalComparison:
     summary: str                         # e.g. "Worse than 80% of past runs"
 ```
 
-Each new report is compared against the historical distribution per dimension. Ratings shift from absolute heuristics to relative norms once `min_history` experiments are accumulated (configurable, default = 5).
+Ratings shift from absolute heuristics to relative norms once `min_history` experiments are accumulated (configurable, default = 5).
 
 ---
 
-### 4.5 Report Synthesizer (`report_synthesizer.py`)
+### 5.5 Report Synthesizer (`report_synthesizer.py`)
 
-Combines quantitative metrics, qualitative judge outputs, and historical comparisons into the structured diagnostic report.
+Standalone synthesis logic — not derived from CLEAR's `synthesize_shortcomings_from_df`. CLEAR's function is coupled to the per-evaluation-call CSV format and is incompatible with time-series iteration records.
 
 ```python
 @dataclass
@@ -484,6 +599,7 @@ class DimensionReport:
     evidence: List[str]                  # iteration pointers + log excerpts
     historical: Optional[HistoricalComparison]
     recommendation: str
+    data_available: bool                 # False when degraded due to missing log fields
 
 @dataclass
 class EvolveLoopReport:
@@ -517,7 +633,7 @@ Recommendation: Add rolling improvement rate stopping criterion; would have save
            ~35 iterations and ~$40 in this experiment.
 ```
 
-**Aggregate synthesis** reuses CLEAR's existing `synthesize_shortcomings_from_df` and `map_shortcomings_to_records` pattern:
+**Aggregate cross-tabulation** (implemented locally, not via CLEAR):
 
 ```
 Compliance level    │ Success rate │ Avg score_delta
@@ -529,7 +645,7 @@ non_compliant       │     3%       │   -0.012
 
 ---
 
-## 5. Data Flow Detail
+## 6. Data Flow Detail
 
 ```
 standard JSONL records
@@ -551,23 +667,24 @@ standard JSONL records
                                 │
                                 ├──► LLM Judge: stagnation root cause     (Step A)
                                 ├──► LLM Judge: artifact clustering        (Step B)
-                                ├──► LLM Judge: per-mutation quality       (Step C)
-                                ├──► LLM Judge: semantic compliance        (Step D)
+                                ├──► LLM Judge: per-mutation quality       (Step C)  ← run_parallel
+                                ├──► LLM Judge: semantic compliance        (Step D)  ← run_parallel
                                 ├──► LLM Judge: exploration structure      (Step E)
                                 ├──► LLM Judge: meta-analysis quality      (Step F)
+                                │       ↑ all via clear_eval.llm + cache_call
                                 │
-                                ├──► Comparative Analyzer (historical DB)
+                                ├──► Comparative Analyzer (historical_db.py)
                                 │
                                 └──► Report Synthesizer
                                                 │
                                                 └──► ZIP (parquet + metadata) → dashboard
 ```
 
-All LLM judge calls use CLEAR's existing `LLMClient` abstraction, caching, and `run_parallel` threading — no new LLM infrastructure is needed.
+LLM judge calls use `get_llm_client`, `run_parallel`, and `cache_call` from the vendored `evolve_analyzer.llm` package. No CLEAR modules, pipeline classes, use case interfaces, or dashboard components are imported at runtime.
 
 ---
 
-## 6. Graceful Degradation
+## 7. Graceful Degradation
 
 The system degrades gracefully based on available log richness:
 
@@ -579,20 +696,18 @@ The system degrades gracefully based on available log richness:
 | + Reasoning traces | + Meta-analysis quality (LLM) |
 | + Historical DB (n ≥ 5) | + Comparative ratings on all dimensions |
 
-Dimension reports include a `data_available` flag so the dashboard can indicate which dimensions had full vs. degraded analysis.
+`DimensionReport.data_available` is `False` for any dimension that lacked the required input fields, so the dashboard can surface which dimensions were fully vs. partially analyzed.
 
 ---
 
-## 7. CLI Integration
-
-New CLI entry point added to `cli.py`:
+## 8. CLI
 
 ```bash
-run-clear-evolve-analysis \
+run-evolve-analysis \
     --source skydiscover \
     --checkpoint-dir results/circle_packing/checkpoints/checkpoint_100 \
     --provider openai \
-    --eval-model-name gpt-4o \
+    --model gpt-4o \
     --output-dir results/evolve_analysis/ \
     --stagnation-threshold 10 \
     --min-delta 0.001 \
@@ -603,11 +718,11 @@ run-clear-evolve-analysis \
 
 ---
 
-## 8. Dashboard Extension (`evolve_dashboard.py`)
+## 9. Dashboard (`dashboard.py`)
 
-Extended Streamlit dashboard with evolve-loop-specific panels:
+Standalone Streamlit application — not an extension of CLEAR's dashboard. The UI paradigm is time-series and aggregate statistics, incompatible with CLEAR's per-call table browser.
 
-**New panels:**
+**Panels:**
 
 1. **Score Progression** — line chart with stagnation periods shaded (red/orange), breakthrough iterations annotated, change-points marked
 2. **Alert Panel** — all triggered alerts sorted by severity, with expandable sequence table and LLM root cause
@@ -622,50 +737,76 @@ Extended Streamlit dashboard with evolve-loop-specific panels:
 
 ---
 
-## 9. Dependencies on Existing CLEAR Components
+## 10. Vendored Code Origin
 
-| CLEAR component | Used by |
-|---|---|
-| `LLMClient` / `get_llm_client` | All LLM judge steps |
-| `run_parallel` | Parallel per-mutation judge calls (Step C) |
-| `caching_utils` | Resume support for all LLM judge steps |
-| `synthesize_shortcomings_from_df` | Report Synthesizer aggregate synthesis |
-| `map_shortcomings_to_records` | Report Synthesizer iteration mapping |
-| `save_ui_input_results` | ZIP output for dashboard |
-| `show_analysis_dashboard` | Base dashboard, extended with evolve panels |
-| `load_config` / `merge_configs` | Configuration loading |
+Three modules are copied from CLEAR at project creation and maintained independently under `evolve_analyzer/llm/`. Each file carries a header comment recording the source:
+
+```python
+# Vendored from clear_eval/llm/client.py (CLEAR commit <hash>, <date>).
+# Maintained independently within evolve-analyzer.
+# To incorporate upstream improvements, diff manually against the CLEAR source.
+```
+
+| Vendored module | Origin in CLEAR | Purpose |
+|---|---|---|
+| `evolve_analyzer/llm/client.py` | `clear_eval/llm/client.py` | LLM provider abstraction (OpenAI, Anthropic, LiteLLM, local endpoint) |
+| `evolve_analyzer/llm/parallel.py` | `clear_eval/llm/parallel.py` | Thread-pool wrapper for concurrent LLM calls |
+| `evolve_analyzer/llm/cache.py` | `clear_eval/caching_utils.py` | Disk cache — skip already-judged records on re-run |
+
+CLEAR does not appear in `pyproject.toml`. There is no runtime dependency on CLEAR. After the initial copy, the two codebases evolve independently.
 
 ---
 
-## 10. Configuration
-
-New config keys under `default_config.yaml`:
+## 11. Configuration (`config/default_config.yaml`)
 
 ```yaml
-# Evolve loop analysis settings
-evolve_loop:
-  source: "jsonl"                    # jsonl | skydiscover | shinkaevolve | openevolve
-  stagnation_threshold: 10           # alert when streak >= this value
-  min_delta: 0.001                   # minimum score improvement to count as progress
-  convergence_window: 10             # rolling window for mean/variance
-  top_k_solutions: 10                # top-K for search space analysis
-  score_variance_threshold: 0.1      # flag evaluator runs with std > this value
+# LLM backend (via clear_eval.llm)
+llm:
+  provider: "openai"              # openai | anthropic | litellm | endpoint
+  model: "gpt-4o"
+  temperature: 0.0
+  max_tokens: 4096
 
-  # Compliance checks (deterministic)
+# Ingestion
+ingestion:
+  source: "jsonl"                 # jsonl | skydiscover | shinkaevolve | openevolve
+
+# Stagnation detection
+stagnation:
+  threshold: 10                   # alert when streak >= this value
+  min_delta: 0.001                # minimum score improvement to count as progress
+
+# Convergence
+convergence:
+  window: 10                      # rolling window for mean/variance
+
+# Search space
+search_space:
+  top_k: 10                       # top-K solutions for parameter distribution
+
+# Evaluator
+evaluator:
+  score_variance_threshold: 0.1   # flag runs with std > this value
+
+# Compliance checks (deterministic)
+compliance:
   check_evolve_block: true
   check_format: true
   check_signature: true
-  check_semantic_compliance: true    # LLM-as-judge semantic compliance
+  check_semantic: true            # LLM-as-judge semantic compliance (Step D)
 
-  # LLM judge steps
-  analyze_stagnation: true           # root cause analysis on stagnation periods
-  analyze_artifacts: true            # evaluator artifact clustering
-  analyze_mutations: true            # per-mutation quality
-  analyze_exploration: true          # structural diversity from code diffs
-  analyze_meta_quality: true         # reasoning trace coherence
+# LLM judge steps (can disable individually to save cost)
+judges:
+  stagnation_root_cause: true     # Step A
+  artifact_clustering: true       # Step B
+  mutation_quality: true          # Step C
+  semantic_compliance: true       # Step D
+  exploration_structure: true     # Step E
+  meta_quality: true              # Step F
 
-  # Historical / comparative analysis
-  historical_db_path: null           # path to SQLite DB; null disables comparison
-  min_history_for_relative_rating: 5 # experiments needed before relative ratings
-  pattern_promotion_threshold: 3     # recurring pattern → standing recommendation
+# Historical / comparative analysis
+historical:
+  db_path: null                   # path to SQLite DB; null disables comparison
+  min_experiments: 5              # experiments needed before relative ratings activate
+  pattern_promotion_threshold: 3  # pattern recurring in N experiments → standing recommendation
 ```
